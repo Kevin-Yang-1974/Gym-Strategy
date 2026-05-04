@@ -253,6 +253,15 @@ def write_report(summary):
 	best_counts.columns = ["最优策略编号", "出现次数"]
 	s5_first_count = int(summary["S5是否第一"].sum())
 	s4_first_count = int(summary["S4是否第一"].sum())
+	other_best = best_counts[~best_counts["最优策略编号"].isin(["S5", "S4"])]
+	if other_best.empty:
+		other_best_text = "其余策略未在该短期网格中排名第一"
+	else:
+		parts = [
+			f"{row['最优策略编号']} 在 {int(row['出现次数'])} 个情景中排名第一"
+			for _, row in other_best.iterrows()
+		]
+		other_best_text = "；".join(parts)
 	total_count = int(len(summary))
 	gap_min = float(summary["S5相对S0利润差"].min())
 	gap_max = float(summary["S5相对S0利润差"].max())
@@ -326,7 +335,7 @@ $$
 
 $\\gamma_\\kappa$ 越大，积分带来的活跃提升越容易通过语义更新放大到线上互动、消费结构和近因类特征中；$\\epsilon_\\kappa$ 越大，低活跃用户在 $A_{{i,t}}$ 很小时的相对放大效应会被削弱。因此，该组灵敏度分析主要检验 SERF 反事实推理是否过度依赖“低活跃用户被强放大”的特征更新假设。
 
-从结果看，S5 在 20 个情景中有 {s5_first_count} 个情景排名第一，说明其短期综合促活排序对 $\\kappa$ 参数扰动仍较强；S4 在 {s4_first_count} 个情景中排名第一，S3 在 1 个情景中排名第一，说明最优策略并非对 $\\gamma_\\kappa$ 和 $\\epsilon_\\kappa$ 完全不敏感。{gap_text}
+从结果看，S5 在 20 个情景中有 {s5_first_count} 个情景排名第一，说明其短期综合促活排序对 $\\kappa$ 参数扰动仍较强；S4 在 {s4_first_count} 个情景中排名第一，{other_best_text}，说明最优策略并非对 $\\gamma_\\kappa$ 和 $\\epsilon_\\kappa$ 完全不敏感。{gap_text}
 
 当 $\\epsilon_\\kappa$ 增大时，低活跃用户的相对放大效应被削弱，S5 的续费概率提升和相对利润表现整体下降；当 $\\gamma_\\kappa$ 增大时，语义放大效应增强，S5 的续费概率提升通常上升，但高强度补贴带来的短期利润压力仍存在。作为对照，{s4_gap_text} 因此，该组结果应与多延期窗口灵敏度分析共同解释：S5 的短期综合促活能力较稳，但短期利润承压；S4 的短期利润表现相对更稳健。若从多延期窗口 TOPSIS 排序稳定性和落地稳健性看，仍应保持“**S4 流失召回强化策略作为稳健主推荐，S5 高强度综合激励策略作为进攻型备选**”的最终口径。
 
