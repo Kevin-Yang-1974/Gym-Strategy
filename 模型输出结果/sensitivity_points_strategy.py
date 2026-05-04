@@ -197,22 +197,32 @@ def compute_response_params(pop, rho_scale=1.0, q_scale=1.0):
 	q75 = pop["A_score"].quantile(0.75)
 	if q75 <= 0:
 		q75 = pop["A_score"].mean() + 1e-5
-	target = pop.loc[pop["A_score"] >= q75, "A_score"].mean()
+	target_a = pop.loc[pop["A_score"] >= q75, "A_score"].mean()
+	q75_s = pop["S_score"].quantile(0.75)
+	if q75_s <= 0:
+		q75_s = pop["S_score"].mean() + 1e-5
+	target_s = pop.loc[pop["S_score"] >= q75_s, "S_score"].mean()
 
 	params = {}
 	for state, base in sim.GROUP_PARAMS.items():
 		mask = pop["user_state"] == state
 		mean_a = pop.loc[mask, "A_score"].mean() if mask.sum() else pop["A_score"].mean()
+		mean_s = pop.loc[mask, "S_score"].mean() if mask.sum() else pop["S_score"].mean()
 		rho = float(base["rho"] * rho_scale)
 		q = float(np.clip(base["q"] * q_scale, 1e-6, 0.95))
-		alpha_base = max(rho * (target - mean_a), rho * 2.0)
-		beta_base = -np.log(1 - q) / base["pref"]
+		alpha_base = max(rho * (target_a - mean_a), rho * 2.0)
+		alpha_s_base = max(rho * (target_s - mean_s), rho * 2.0)
+		beta_p0_base = -np.log(1 - q) / base["pref_p0"]
+		beta_p1_base = -np.log(1 - q) / base["pref_p1"]
 		params[state] = {
-			"alpha_base": alpha_base,
-			"beta_base": beta_base,
+			"alpha_a_base": alpha_base,
+			"alpha_s_base": alpha_s_base,
+			"beta_p0_base": beta_p0_base,
+			"beta_p1_base": beta_p1_base,
 			"rho": rho,
 			"q": q,
-			"pref": base["pref"],
+			"pref_p0": base["pref_p0"],
+			"pref_p1": base["pref_p1"],
 		}
 	return params
 
@@ -276,7 +286,7 @@ def summarize_scenario(scenario, detail_df, topsis_df):
 	}
 
 
-def run_one_scenario(pop, serf_model, serf_meta, serf_context, scenario):
+def run_one_scenario(pop, serf_model, serf_meta, pt_model, pt_meta, serf_context, pt_context, scenario):
 	old_c_point = sim.C_POINT
 	old_eta = sim.ETA
 	try:
@@ -290,6 +300,7 @@ def run_one_scenario(pop, serf_model, serf_meta, serf_context, scenario):
 			sim.BASE_DELAY_COUNT,
 		)
 		serf_cache = {}
+		pt_cache = {}
 		rows = []
 		for strategy in strategies:
 			summary, _ = sim.simulate_strategy(
@@ -299,8 +310,12 @@ def run_one_scenario(pop, serf_model, serf_meta, serf_context, scenario):
 				model_scenario,
 				serf_model,
 				serf_meta,
+				pt_model,
+				pt_meta,
 				serf_cache,
+				pt_cache,
 				serf_context,
+				pt_context,
 			)
 			rows.append(summary)
 		detail_df = pd.DataFrame(rows)
@@ -392,7 +407,7 @@ def write_report(summary_df):
 
 	report = f"""#5.7 积分策略灵敏度分析报告
 
-本文件由 `模型输出结果/sensitivity_points_strategy.py` 自动生成，用于检验积分策略模拟结果对关键情景参数的敏感性。分析口径与主策略模拟保持一致：会员续费概率由状态增强随机森林 SERF 工件进行反事实推理，私教购买概率保持随机森林预测基线，不使用早期的 `lambda_renew` 或 `lambda_pt` 线性概率加成。
+本文件由 `模型输出结果/sensitivity_points_strategy.py` 自动生成，用于检验积分策略模拟结果对关键情景参数的敏感性。分析口径与主策略模拟保持一致：用户先根据线下积分系数 $p_0$ 和线上积分系数 $p_1$ 产生行为响应，再按响应后的线上线下活跃特征计算积分、调用状态增强随机森林 SERF 和增强私教购买模型进行反事实推理，不使用早期的 `lambda_renew` 或 `lambda_pt` 线性概率加成。
 
 ##1. 分析设置
 
@@ -428,13 +443,23 @@ def write_report(summary_df):
 
 def main():
 	sim.OUT_DIR.mkdir(parents=True, exist_ok=True)
-	pop, serf_model, serf_meta = sim.load_population()
+	pop, serf_model, serf_meta, pt_model, pt_meta = sim.load_population()
 	serf_context = sim.build_serf_fast_context(pop, serf_model, serf_meta)
+	pt_context = sim.build_pt_fast_context(pop, pt_model, pt_meta)
 
 	detail_frames = []
 	summary_rows = []
 	for scenario in SENSITIVITY_SCENARIOS:
-		detail_df, summary = run_one_scenario(pop, serf_model, serf_meta, serf_context, scenario)
+		detail_df, summary = run_one_scenario(
+			pop,
+			serf_model,
+			serf_meta,
+			pt_model,
+			pt_meta,
+			serf_context,
+			pt_context,
+			scenario,
+		)
 		detail_frames.append(detail_df)
 		summary_rows.append(summary)
 

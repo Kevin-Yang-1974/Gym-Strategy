@@ -137,10 +137,10 @@ STRATEGIES = [
 ]
 
 GROUP_PARAMS = {
-	"Z1_高活跃高消费用户": {"rho":0.25, "q":0.18, "pref":160},
-	"Z6_私教潜在用户": {"rho":0.45, "q":0.28, "pref":220},
-	"Z7_流失风险用户": {"rho":0.35, "q":0.22, "pref":240},
-	"其他": {"rho":0.30, "q":0.20, "pref":200},
+	"Z1_高活跃高消费用户": {"rho":0.25, "q":0.18, "pref_p0":10, "pref_p1":4},
+	"Z6_私教潜在用户": {"rho":0.45, "q":0.28, "pref_p0":10, "pref_p1":4},
+	"Z7_流失风险用户": {"rho":0.35, "q":0.22, "pref_p0":12, "pref_p1":5},
+	"其他": {"rho":0.30, "q":0.20, "pref_p0":10, "pref_p1":4},
 }
 
 SEMANTIC_GAMMA =0.5
@@ -156,13 +156,19 @@ SERF_RESPONSE_FEATURES = [
 	"interact_recency_score",
 ]
 SERF_CATEGORICAL_MISSING_TOKEN = "缺失"
-SERF_M_SCALE_FEATURES = [
-	"pt_amount",
-	"pt_order_count",
-	"pt_private_amount",
-	"pt_sessions_bought",
-	"pt_amount_total_before",
-	"pt_sessions_bought_before",
+OFFLINE_ACTIVITY_FEATURES = [
+	"visit_count",
+	"stay_hours_total",
+	"run_distance_total",
+	"calorie_total",
+	"anaerobic_volume",
+]
+ONLINE_ACTIVITY_FEATURES = [
+	"post_count",
+	"like_given_count",
+	"comment_given_count",
+	"like_received_count",
+	"comment_received_count",
 ]
 SERF_L_RESPONSE_FEATURES = [
 	"buy_stickiness",
@@ -184,30 +190,6 @@ PT_META_REQUIRED_KEYS = [
 	"prior_correction",
 ]
 PT_CATEGORICAL_MISSING_TOKEN = "缺失"
-PT_ACTIVITY_FEATURES = [
-	"visit_count",
-	"stay_hours_total",
-	"run_distance_total",
-	"run_minutes_total",
-	"calorie_total",
-]
-PT_STRENGTH_FEATURES = [
-	"anaerobic_volume",
-	"anaerobic_count",
-	"anaerobic_calorie_total",
-]
-PT_INTERACTION_FEATURES = [
-	"post_count",
-	"like_given_count",
-	"comment_given_count",
-	"like_received_count",
-	"comment_received_count",
-]
-PT_RECENCY_DAY_FEATURES = [
-	"days_since_last_visit",
-	"days_since_last_active",
-	"days_since_last_interact",
-]
 
 
 def load_serf_artifacts():
@@ -392,13 +374,25 @@ def build_pt_fast_context(pop, model, meta):
 	}
 
 
-def fast_score_pt_counterfactual_probability(pop, delta_a, context):
-	delta_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
-	if float(delta_series.sum()) <= EPS:
+def active_response_scales(pop, delta_a, delta_s):
+	a_old = pd.to_numeric(pop["A_score"], errors="coerce").fillna(0).clip(lower=0)
+	s_old = pd.to_numeric(pop["S_score"], errors="coerce").fillna(0).clip(lower=0)
+	delta_a = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	offline_scale = 1 + SEMANTIC_GAMMA * np.log1p(delta_a / (a_old + FEATURE_UPDATE_EPS))
+	online_scale = 1 + SEMANTIC_GAMMA * np.log1p(delta_s / (s_old + FEATURE_UPDATE_EPS))
+	return offline_scale, online_scale
+
+
+def fast_score_pt_counterfactual_probability(pop, delta_a, delta_s, context):
+	delta_a_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s_series = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	if float(delta_a_series.sum() + delta_s_series.sum()) <= EPS:
 		return pop["p_pt_base"]
 	idx = context["num_index"]
 	raw = context["base_numeric"].copy()
-	delta = delta_series.to_numpy(dtype=np.float64)
+	delta_a_arr = delta_a_series.to_numpy(dtype=np.float64)
+	delta_s_arr = delta_s_series.to_numpy(dtype=np.float64)
 	source_overrides = {}
 
 	def get_raw(col, default=0.0, lower=None, upper=None):
@@ -423,19 +417,31 @@ def fast_score_pt_counterfactual_probability(pop, delta_a, context):
 			raw[:,idx[col]] = value
 
 	a_old = get_raw("A_score", 0.0, lower=0.0)
-	scale = 1 + SEMANTIC_GAMMA * np.log1p(delta / (a_old + FEATURE_UPDATE_EPS))
-	a_new = a_old + delta
+	s_old = get_raw("S_score", 0.0, lower=0.0)
+	offline_scale = 1 + SEMANTIC_GAMMA * np.log1p(delta_a_arr / (a_old + FEATURE_UPDATE_EPS))
+	online_scale = 1 + SEMANTIC_GAMMA * np.log1p(delta_s_arr / (s_old + FEATURE_UPDATE_EPS))
+	a_new = a_old + delta_a_arr
+	s_new = s_old + delta_s_arr
 	set_raw("A_score", a_new)
 	if "S_score" in idx:
-		set_raw("S_score", get_raw("S_score", 0.0, lower=0.0) * scale)
-	for col in PT_ACTIVITY_FEATURES + PT_STRENGTH_FEATURES + PT_INTERACTION_FEATURES:
+		set_raw("S_score", s_new)
+	for col in OFFLINE_ACTIVITY_FEATURES:
 		if col in idx:
-			set_raw(col, get_raw(col, 0.0, lower=0.0) * scale)
-	for col in PT_RECENCY_DAY_FEATURES:
+			set_raw(col, get_raw(col, 0.0, lower=0.0) * offline_scale)
+	for col in ONLINE_ACTIVITY_FEATURES:
 		if col in idx:
-			set_raw(col, get_raw(col, 999.0, lower=0.0) / np.where(scale == 0, 1, scale))
+			set_raw(col, get_raw(col, 0.0, lower=0.0) * online_scale)
+	for col in ["days_since_last_visit", "days_since_last_active"]:
+		updated = get_raw(col, 999.0, lower=0.0) / np.where(offline_scale == 0, 1, offline_scale)
+		if col in idx:
+			set_raw(col, updated)
 		else:
-			source_overrides[col] = get_raw(col, 999.0, lower=0.0) / np.where(scale == 0, 1, scale)
+			source_overrides[col] = updated
+	updated_interact_days = get_raw("days_since_last_interact", 999.0, lower=0.0) / np.where(online_scale == 0, 1, online_scale)
+	if "days_since_last_interact" in idx:
+		set_raw("days_since_last_interact", updated_interact_days)
+	else:
+		source_overrides["days_since_last_interact"] = updated_interact_days
 
 	visit_days = get_raw("days_since_last_visit", 999.0, lower=0.0)
 	buy_days = get_raw("days_since_last_buy", 999.0, lower=0.0)
@@ -548,72 +554,77 @@ def build_serf_fast_context(pop, model, meta):
 	}
 
 
-def semantic_scale(a_old, delta_a):
-	a_old = pd.to_numeric(a_old, errors="coerce").fillna(0).clip(lower=0)
-	delta_a = pd.Series(delta_a, index=a_old.index).fillna(0).clip(lower=0)
-	return 1 + SEMANTIC_GAMMA * np.log1p(delta_a / (a_old + FEATURE_UPDATE_EPS))
-
-
-def build_serf_counterfactual_source(df, delta_a):
+def build_serf_counterfactual_source(df, delta_a, delta_s):
 	out = df.copy()
 	delta_a = pd.Series(delta_a, index=out.index).fillna(0).clip(lower=0)
-	a_old = pd.to_numeric(out["A_score"], errors="coerce").fillna(0).clip(lower=0)
-	scale = semantic_scale(a_old, delta_a)
-	out["A_score"] = a_old + delta_a
-	out["S_score"] = pd.to_numeric(out["S_score"], errors="coerce").fillna(0).clip(lower=0) * scale
-	for col in SERF_M_SCALE_FEATURES:
+	delta_s = pd.Series(delta_s, index=out.index).fillna(0).clip(lower=0)
+	offline_scale, online_scale = active_response_scales(out, delta_a, delta_s)
+	out["A_score"] = pd.to_numeric(out["A_score"], errors="coerce").fillna(0).clip(lower=0) + delta_a
+	out["S_score"] = pd.to_numeric(out["S_score"], errors="coerce").fillna(0).clip(lower=0) + delta_s
+	for col in OFFLINE_ACTIVITY_FEATURES:
 		if col in out.columns:
-			out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).clip(lower=0) * scale
+			out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).clip(lower=0) * offline_scale
+	for col in ONLINE_ACTIVITY_FEATURES:
+		if col in out.columns:
+			out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).clip(lower=0) * online_scale
 	if "serf_user_state" in out.columns:
 		out["user_state"] = out["serf_user_state"]
-	return out, scale
+	return out, offline_scale, online_scale
 
 
-def build_pt_counterfactual_source(df, delta_a):
+def build_pt_counterfactual_source(df, delta_a, delta_s):
 	out = df.copy()
 	delta_a = pd.Series(delta_a, index=out.index).fillna(0).clip(lower=0)
-	a_old = pd.to_numeric(out["A_score"], errors="coerce").fillna(0).clip(lower=0)
-	scale = semantic_scale(a_old, delta_a)
-	out["A_score"] = a_old + delta_a
+	delta_s = pd.Series(delta_s, index=out.index).fillna(0).clip(lower=0)
+	offline_scale, online_scale = active_response_scales(out, delta_a, delta_s)
+	out["A_score"] = pd.to_numeric(out["A_score"], errors="coerce").fillna(0).clip(lower=0) + delta_a
 	if "S_score" in out.columns:
-		out["S_score"] = pd.to_numeric(out["S_score"], errors="coerce").fillna(0).clip(lower=0) * scale
-	for col in PT_ACTIVITY_FEATURES + PT_STRENGTH_FEATURES + PT_INTERACTION_FEATURES:
+		out["S_score"] = pd.to_numeric(out["S_score"], errors="coerce").fillna(0).clip(lower=0) + delta_s
+	for col in OFFLINE_ACTIVITY_FEATURES:
 		if col in out.columns:
-			out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).clip(lower=0) * scale
-	for col in PT_RECENCY_DAY_FEATURES:
+			out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).clip(lower=0) * offline_scale
+	for col in ONLINE_ACTIVITY_FEATURES:
+		if col in out.columns:
+			out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).clip(lower=0) * online_scale
+	for col in ["days_since_last_visit", "days_since_last_active"]:
 		if col in out.columns:
 			base_days = pd.to_numeric(out[col], errors="coerce").fillna(999).clip(lower=0)
-			out[col] = (base_days / scale.replace(0, 1)).clip(lower=0)
+			out[col] = (base_days / offline_scale.replace(0, 1)).clip(lower=0)
+	if "days_since_last_interact" in out.columns:
+		base_days = pd.to_numeric(out["days_since_last_interact"], errors="coerce").fillna(999).clip(lower=0)
+		out["days_since_last_interact"] = (base_days / online_scale.replace(0, 1)).clip(lower=0)
 	if "pt_user_state" in out.columns:
 		out["user_state"] = out["pt_user_state"]
 	return out
 
 
-def cached_pt_counterfactual_probability(pop, delta_a, model, meta, cache, cache_key, pt_context=None):
-	delta_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
-	if float(delta_series.sum()) <= EPS:
+def cached_pt_counterfactual_probability(pop, delta_a, delta_s, model, meta, cache, cache_key, pt_context=None):
+	delta_a_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s_series = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	if float(delta_a_series.sum() + delta_s_series.sum()) <= EPS:
 		return pop["p_pt_base"]
 	prob_key = ("pt_prob", *cache_key)
 	if cache is not None and prob_key in cache:
 		return cache[prob_key]
 	if pt_context is not None:
-		prob = fast_score_pt_counterfactual_probability(pop, delta_series, pt_context)
+		prob = fast_score_pt_counterfactual_probability(pop, delta_a_series, delta_s_series, pt_context)
 	else:
-		source = build_pt_counterfactual_source(pop, delta_series)
+		source = build_pt_counterfactual_source(pop, delta_a_series, delta_s_series)
 		prob = score_pt_probability(source, model, meta)
 	if cache is not None:
 		cache[prob_key] = prob
 	return prob
 
 
-def cached_pt_counterfactual_metrics(pop, delta_a, price_p, model, meta, cache, cache_key, pt_context=None):
-	delta_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
-	if float(delta_series.sum()) <= EPS:
+def cached_pt_counterfactual_metrics(pop, delta_a, delta_s, price_p, model, meta, cache, cache_key, pt_context=None):
+	delta_a_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s_series = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	if float(delta_a_series.sum() + delta_s_series.sum()) <= EPS:
 		return float((pop["p_pt_base"] * price_p).sum()), 0.0
 	metrics_key = ("pt_metrics", *cache_key)
 	if cache is not None and metrics_key in cache:
 		return cache[metrics_key]
-	prob = cached_pt_counterfactual_probability(pop, delta_series, model, meta, cache, cache_key, pt_context)
+	prob = cached_pt_counterfactual_probability(pop, delta_a_series, delta_s_series, model, meta, cache, cache_key, pt_context)
 	metrics = (
 		float((prob * price_p).sum()),
 		float((prob - pop["p_pt_base"]).sum()),
@@ -623,8 +634,8 @@ def cached_pt_counterfactual_metrics(pop, delta_a, price_p, model, meta, cache, 
 	return metrics
 
 
-def prepare_serf_counterfactual_scoring_frame(df, delta_a, meta):
-	source, scale = build_serf_counterfactual_source(df, delta_a)
+def prepare_serf_counterfactual_scoring_frame(df, delta_a, delta_s, meta):
+	source, offline_scale, online_scale = build_serf_counterfactual_source(df, delta_a, delta_s)
 	base_source = df.copy()
 	if "serf_user_state" in base_source.columns:
 		base_source["user_state"] = base_source["serf_user_state"]
@@ -632,6 +643,7 @@ def prepare_serf_counterfactual_scoring_frame(df, delta_a, meta):
 	frame = prepare_serf_scoring_frame(source, meta)
 	for col in SERF_L_RESPONSE_FEATURES:
 		if col in frame.columns:
+			scale = online_scale if col == "interact_recency_score" else offline_scale
 			frame[col] = pd.to_numeric(base_frame[col], errors="coerce").fillna(0).clip(lower=0) * scale
 	for col in SERF_RECENCY_SCORE_FEATURES:
 		if col in frame.columns:
@@ -639,34 +651,42 @@ def prepare_serf_counterfactual_scoring_frame(df, delta_a, meta):
 	return frame[meta["feature_order"]]
 
 
-def score_serf_counterfactual_renewal_probability(df, delta_a, model, meta):
-	x = prepare_serf_counterfactual_scoring_frame(df, delta_a, meta)
+def score_serf_counterfactual_renewal_probability(df, delta_a, delta_s, model, meta):
+	x = prepare_serf_counterfactual_scoring_frame(df, delta_a, delta_s, meta)
 	prob = model.predict_proba(x)[:,1]
 	return pd.Series(prob, index=df.index, name="p_renew_new").clip(0,1)
 
 
-def fast_score_serf_counterfactual_probability(pop, delta_a, context):
-	delta_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
-	if float(delta_series.sum()) <= EPS:
+def fast_score_serf_counterfactual_probability(pop, delta_a, delta_s, context):
+	delta_a_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s_series = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	if float(delta_a_series.sum() + delta_s_series.sum()) <= EPS:
 		return pop["p_renew_base"]
 	idx = context["num_index"]
 	raw = context["base_numeric"].copy()
-	delta = delta_series.to_numpy(dtype=np.float64)
+	delta_a_arr = delta_a_series.to_numpy(dtype=np.float64)
+	delta_s_arr = delta_s_series.to_numpy(dtype=np.float64)
 	a_old = np.nan_to_num(context["base_numeric"][:,idx["A_score"]], nan=0.0)
 	a_old = np.maximum(a_old,0)
-	scale = 1 + SEMANTIC_GAMMA * np.log1p(delta / (a_old + FEATURE_UPDATE_EPS))
-	a_new = a_old + delta
-	raw[:,idx["A_score"]] = a_new
+	s_old = np.zeros(len(delta_a_arr), dtype=np.float64)
 	if "S_score" in idx:
 		s_old = np.nan_to_num(context["base_numeric"][:,idx["S_score"]], nan=0.0)
-		s_new = np.maximum(s_old,0) * scale
+		s_old = np.maximum(s_old,0)
+	offline_scale = 1 + SEMANTIC_GAMMA * np.log1p(delta_a_arr / (a_old + FEATURE_UPDATE_EPS))
+	online_scale = 1 + SEMANTIC_GAMMA * np.log1p(delta_s_arr / (s_old + FEATURE_UPDATE_EPS))
+	a_new = a_old + delta_a_arr
+	s_new = s_old + delta_s_arr
+	raw[:,idx["A_score"]] = a_new
+	if "S_score" in idx:
 		raw[:,idx["S_score"]] = s_new
-	else:
-		s_new = np.zeros(len(delta), dtype=np.float64)
-	for col in SERF_M_SCALE_FEATURES:
+	for col in OFFLINE_ACTIVITY_FEATURES:
 		if col in idx:
 			base_value = np.nan_to_num(context["base_numeric"][:,idx[col]], nan=0.0)
-			raw[:,idx[col]] = np.maximum(base_value,0) * scale
+			raw[:,idx[col]] = np.maximum(base_value,0) * offline_scale
+	for col in ONLINE_ACTIVITY_FEATURES:
+		if col in idx:
+			base_value = np.nan_to_num(context["base_numeric"][:,idx[col]], nan=0.0)
+			raw[:,idx[col]] = np.maximum(base_value,0) * online_scale
 	if "active_gap" in idx:
 		raw[:,idx["active_gap"]] = np.maximum(context["active_target"] - a_new,0)
 	if "o2o_strength" in idx:
@@ -674,6 +694,7 @@ def fast_score_serf_counterfactual_probability(pop, delta_a, context):
 	for col in SERF_L_RESPONSE_FEATURES:
 		if col in idx:
 			base_value = np.nan_to_num(context["base_numeric"][:,idx[col]], nan=0.0)
+			scale = online_scale if col == "interact_recency_score" else offline_scale
 			raw[:,idx[col]] = np.maximum(base_value,0) * scale
 	for col in SERF_RECENCY_SCORE_FEATURES:
 		if col in idx:
@@ -685,22 +706,24 @@ def fast_score_serf_counterfactual_probability(pop, delta_a, context):
 	return pd.Series(prob, index=pop.index, name="p_renew_new").clip(0,1)
 
 
-def score_serf_counterfactual_probability(pop, delta_a, model, meta, serf_context=None):
+def score_serf_counterfactual_probability(pop, delta_a, delta_s, model, meta, serf_context=None):
 	if serf_context is not None:
-		return fast_score_serf_counterfactual_probability(pop, delta_a, serf_context)
-	return score_serf_counterfactual_renewal_probability(pop, delta_a, model, meta)
+		return fast_score_serf_counterfactual_probability(pop, delta_a, delta_s, serf_context)
+	return score_serf_counterfactual_renewal_probability(pop, delta_a, delta_s, model, meta)
 
 
-def cached_serf_counterfactual_probability(pop, delta_a, model, meta, cache, cache_key, serf_context=None):
-	delta_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
-	if float(delta_series.sum()) <= EPS:
+def cached_serf_counterfactual_probability(pop, delta_a, delta_s, model, meta, cache, cache_key, serf_context=None):
+	delta_a_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s_series = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	if float(delta_a_series.sum() + delta_s_series.sum()) <= EPS:
 		return pop["p_renew_base"]
 	prob_key = ("prob", *cache_key)
 	if cache is not None and prob_key in cache:
 		return cache[prob_key]
 	prob = score_serf_counterfactual_probability(
 		pop,
-		delta_series,
+		delta_a_series,
+		delta_s_series,
 		model=model,
 		meta=meta,
 		serf_context=serf_context,
@@ -710,16 +733,18 @@ def cached_serf_counterfactual_probability(pop, delta_a, model, meta, cache, cac
 	return prob
 
 
-def cached_serf_counterfactual_metrics(pop, delta_a, price_m, model, meta, cache, cache_key, serf_context=None):
-	delta_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
-	if float(delta_series.sum()) <= EPS:
+def cached_serf_counterfactual_metrics(pop, delta_a, delta_s, price_m, model, meta, cache, cache_key, serf_context=None):
+	delta_a_series = pd.Series(delta_a, index=pop.index).fillna(0).clip(lower=0)
+	delta_s_series = pd.Series(delta_s, index=pop.index).fillna(0).clip(lower=0)
+	if float(delta_a_series.sum() + delta_s_series.sum()) <= EPS:
 		return float((pop["p_renew_base"] * price_m).sum()), 0.0
 	metrics_key = ("metrics", *cache_key)
 	if cache is not None and metrics_key in cache:
 		return cache[metrics_key]
 	prob = score_serf_counterfactual_probability(
 		pop,
-		delta_series,
+		delta_a_series,
+		delta_s_series,
 		model=model,
 		meta=meta,
 		serf_context=serf_context,
@@ -748,21 +773,35 @@ def compute_response_params(pop):
 	q75 = pop["A_score"].quantile(0.75)
 	if q75 <= 0:
 		q75 = pop["A_score"].mean() + 1e-5  # 防止全体为0的极端情况
-	target = pop.loc[pop["A_score"] >= q75, "A_score"].mean()
+	target_a = pop.loc[pop["A_score"] >= q75, "A_score"].mean()
+	q75_s = pop["S_score"].quantile(0.75)
+	if q75_s <= 0:
+		q75_s = pop["S_score"].mean() + 1e-5
+	target_s = pop.loc[pop["S_score"] >= q75_s, "S_score"].mean()
 
 	params = {}
 	for state in GROUP_PARAMS:
 		mask = pop["user_state"] == state
 		if mask.sum() == 0:
 			mean_a = pop["A_score"].mean()
+			mean_s = pop["S_score"].mean()
 		else:
 			mean_a = pop.loc[mask, "A_score"].mean()
+			mean_s = pop.loc[mask, "S_score"].mean()
 
 		base = GROUP_PARAMS[state]
 		# 给一个保底的活跃提升空间 (2.0)，防止活跃用户 alpha 为 0 导致发积分失效
-		alpha_base = max(base["rho"] * (target - mean_a), base["rho"] * 2.0)
-		beta_base = -np.log(1 - base["q"]) / base["pref"]
-		params[state] = {"alpha_base": alpha_base, "beta_base": beta_base, **base}
+		alpha_base = max(base["rho"] * (target_a - mean_a), base["rho"] * 2.0)
+		alpha_s_base = max(base["rho"] * (target_s - mean_s), base["rho"] * 2.0)
+		beta_p0_base = -np.log(1 - base["q"]) / base["pref_p0"]
+		beta_p1_base = -np.log(1 - base["q"]) / base["pref_p1"]
+		params[state] = {
+			"alpha_a_base": alpha_base,
+			"alpha_s_base": alpha_s_base,
+			"beta_p0_base": beta_p0_base,
+			"beta_p1_base": beta_p1_base,
+			**base,
+		}
 	return params
 
 
@@ -793,18 +832,27 @@ def simulate_strategy(
 		delay_window_count = scenario["delay_window_count"]
 
 		df = pop[["user_id", "user_state", "p_renew_base", "p_pt_base", "Price_m", "Price_p", "N_eff", "I_eff",
-				  "A_score"]].copy()
+				  "A_score", "S_score"]].copy()
 		df["bonus"] = df["user_state"].map(lambda s: group_bonus(strategy, s))
-		df["points_w1"] = np.minimum(strategy["p0"] * df["N_eff"] + strategy["p1"] * df["I_eff"] + df["bonus"],
-									 strategy["pmax"])
-		alpha = df["user_state"].map(lambda s: response_params[s]["alpha_base"] * strategy["rho_scale"])
-		beta = df["user_state"].map(lambda s: response_params[s]["beta_base"] * strategy["q_scale"])
-		df["delta_A_w1"] = alpha * (1 - np.exp(-beta * df["points_w1"]))
+		alpha_a = df["user_state"].map(lambda s: response_params[s]["alpha_a_base"] * strategy["rho_scale"])
+		alpha_s = df["user_state"].map(lambda s: response_params[s]["alpha_s_base"] * strategy["rho_scale"])
+		beta_p0 = df["user_state"].map(lambda s: response_params[s]["beta_p0_base"] * strategy["q_scale"])
+		beta_p1 = df["user_state"].map(lambda s: response_params[s]["beta_p1_base"] * strategy["q_scale"])
+		df["delta_A_w1"] = alpha_a * (1 - np.exp(-beta_p0 * strategy["p0"]))
+		df["delta_S_w1"] = alpha_s * (1 - np.exp(-beta_p1 * strategy["p1"]))
+		offline_scale_w1, online_scale_w1 = active_response_scales(pop, df["delta_A_w1"], df["delta_S_w1"])
+		df["N_eff_new"] = (df["N_eff"] * offline_scale_w1).clip(upper=12)
+		df["I_eff_new"] = (df["I_eff"] * online_scale_w1).clip(upper=20)
+		df["points_w1"] = np.minimum(
+			strategy["p0"] * df["N_eff_new"] + strategy["p1"] * df["I_eff_new"] + df["bonus"],
+			strategy["pmax"],
+		)
 
 		p_base = {"renew": df["p_renew_base"], "pt": df["p_pt_base"]}
 		p_renew_curr = cached_serf_counterfactual_probability(
 			pop,
 			df["delta_A_w1"],
+			df["delta_S_w1"],
 			model=serf_model,
 			meta=serf_meta,
 			cache=serf_cache,
@@ -814,6 +862,7 @@ def simulate_strategy(
 		p_pt_curr = cached_pt_counterfactual_probability(
 			pop,
 			df["delta_A_w1"],
+			df["delta_S_w1"],
 			model=pt_model,
 			meta=pt_meta,
 			cache=pt_cache,
@@ -848,21 +897,27 @@ def simulate_strategy(
 			"窗口末私教购买概率提升": p_pt_lift_curr,
 			"窗口私教收入提升": float((WINDOW1_WEIGHT * (p_pt_curr - df["p_pt_base"]) * df["Price_p"]).sum()),
 			"窗口活跃提升": float(df["delta_A_w1"].sum()),
+			"窗口线上活跃提升": float(df["delta_S_w1"].sum()),
+			"窗口结算积分": float(df["points_w1"].sum()),
 		}]
 
 		delayed_rm_total = 0.0
 		delayed_rp_total = 0.0
 		delta_a_total = float(df["delta_A_w1"].sum())
+		delta_s_total = float(df["delta_S_w1"].sum())
 		delta_a_prev = df["delta_A_w1"]
+		delta_s_prev = df["delta_S_w1"]
 		cum_profit = trajectory_rows[0]["累计平台利润"]
 
 		for window_idx in range(2, delay_window_count + 2):
 			delta_a_curr = carry_a * delta_a_prev
+			delta_s_curr = carry_a * delta_s_prev
 			delay_step = window_idx - 1
 
 			renew_income_sum, p_renew_lift_curr = cached_serf_counterfactual_metrics(
 				pop,
 				delta_a_curr,
+				delta_s_curr,
 				df["Price_m"],
 				model=serf_model,
 				meta=serf_meta,
@@ -873,6 +928,7 @@ def simulate_strategy(
 			pt_income_sum, p_pt_lift_curr = cached_pt_counterfactual_metrics(
 				pop,
 				delta_a_curr,
+				delta_s_curr,
 				df["Price_p"],
 				model=pt_model,
 				meta=pt_meta,
@@ -888,6 +944,7 @@ def simulate_strategy(
 			delayed_rm_total += rm_curr
 			delayed_rp_total += rp_curr
 			delta_a_total += float(delta_a_curr.sum())
+			delta_s_total += float(delta_s_curr.sum())
 
 			trajectory_rows.append({
 				"观察期标签": scenario["观察期标签"],
@@ -907,8 +964,11 @@ def simulate_strategy(
 				"窗口末私教购买概率提升": p_pt_lift_curr,
 				"窗口私教收入提升": float(DELAYED_WINDOW_WEIGHT * (pt_income_sum - (df["p_pt_base"] * df["Price_p"]).sum())),
 				"窗口活跃提升": float(delta_a_curr.sum()),
+				"窗口线上活跃提升": float(delta_s_curr.sum()),
+				"窗口结算积分": 0.0,
 			})
 			delta_a_prev = delta_a_curr
+			delta_s_prev = delta_s_curr
 
 		rm_total = rm_w1 + delayed_rm_total
 		rp_total = rp_w1 + delayed_rp_total
@@ -938,6 +998,7 @@ def simulate_strategy(
 			"积分成本": cost_total,
 			"平台利润": profit_total,
 			"总活跃度提升": delta_a_total,
+			"总线上活跃提升": delta_s_total,
 			"最终续费概率提升": p_renew_lift_curr,
 			"最终私教购买概率提升": p_pt_lift_curr,
 			"私教期望购买人数提升": p_pt_lift_curr,
@@ -1112,7 +1173,7 @@ def write_report(summary_df, topsis_df):
 
 ##1. 概率输入与模拟边界
 
-会员续费基线概率不再来自预测 CSV 中的 `普通随机森林_prob`，而是直接使用导出的 SERF 工件 `serf_renewal_h30_model.joblib` 在线推理得到的 $\\hat p_i^{{renew,30}}$。策略实施后，脚本先根据积分响应函数得到 $\\Delta A_i$，再按语义映射规则同步更新 $A_i$、$S_i$、$M_i$ 与 $L_i$ 相关输入特征，并重新调用同一 SERF 工件得到反事实续费概率 $\\hat p_i^{{renew,30,new}}$，不再使用 `lambda_renew` 线性加成。私教购买概率改为使用增强模型工件 `pt_purchase_enhanced_model.joblib` 在线推理：基线概率由原始特征得到，策略后概率由积分改变后的活跃、无氧、互动和近因等反事实特征重新预测得到，并按 `pt_purchase_enhanced_features.json` 中记录的先验比例进行 case-control 先验校正，不再使用 `lambda_pt` 人为加成。由于历史数据中没有真实积分干预记录，积分带来的活跃提升和概率变化属于基于响应假设的情景模拟结果，不解释为真实因果效应。
+会员续费基线概率不再来自预测 CSV 中的 `普通随机森林_prob`，而是直接使用导出的 SERF 工件 `serf_renewal_h30_model.joblib` 在线推理得到的 $\\hat p_i^{{renew,30}}$。策略实施后，脚本先用线下积分系数 $p_0$ 和线上积分系数 $p_1$ 触发用户线下活跃响应 $\\Delta A_i$ 和线上互动响应 $\\Delta S_i$；再将到店次数、在馆时长、跑步距离、运动消耗、无氧训练量等线下特征，以及发帖、点赞、评论、被点赞、被评论等线上特征按响应强度等比放大；随后按响应后的有效线下和线上行为计算窗口 1 实际获得积分；最后重新调用同一 SERF 工件和增强私教购买模型得到反事实续费概率与私教购买概率，不再使用 `lambda_renew` 或 `lambda_pt` 线性加成。由于历史数据中没有真实积分干预记录，积分带来的活跃提升和概率变化属于基于响应假设的情景模拟结果，不解释为真实因果效应。
 
 ##2. 两阶段窗口设定
 
